@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+env/
+
+# Database
+*.db
+
+# Logs
+*.log
+
+# React / Node
+node_modules/
+build/
+dist/
+
+# OS files
+.DS_Store
+Thumbs.db
