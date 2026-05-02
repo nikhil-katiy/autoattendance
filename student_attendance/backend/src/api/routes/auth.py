@@ -96,9 +96,9 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-@router.get("/Dashboard")
-def dashboard(user=Depends(verify_token)):
-    return {
-        "message": "Welcome to dashboard",
-        "user": user
-    }
+# @router.get("/Dashboard")
+# def dashboard(user=Depends(verify_token)):
+#     return {
+#         "message": "Welcome to dashboard",
+#         "user": user
+#     }

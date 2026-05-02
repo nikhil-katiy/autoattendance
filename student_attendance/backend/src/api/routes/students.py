@@ -9,7 +9,6 @@ def get_students():
     conn = get_conn()
     cur = conn.cursor()
 
-    #  FULL DATA
     cur.execute("""
         SELECT 
             student_id,

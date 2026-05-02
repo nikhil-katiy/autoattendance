@@ -6,6 +6,8 @@ from src.api.routes import face, attendance, auth, students
 from src.db.database import init_db
 from src.services.scheduler import start_scheduler
 from src.api.routes.addsession import router as addsession_router
+from src.api.routes import attendance
+
 
 
 
@@ -30,7 +32,8 @@ app.include_router(face.router)
 app.include_router(attendance.router)
 app.include_router(auth.router)
 app.include_router(students.router)
-app.include_router(addsession_router)   
+app.include_router(addsession_router) 
+  
 
 @app.get("/")
 def root():

@@ -81,7 +81,14 @@ def insert_embedding(student_id, name, angle, embedding, image_bytes):
     conn = get_conn()
     cur = conn.cursor()
 
-    emb_bytes = embedding.astype(np.float32).tobytes()
+    # 🔥 FIX: ensure numpy
+    embedding = np.array(embedding)
+
+    norm = np.linalg.norm(embedding)
+    if norm != 0:
+        embedding = embedding / norm
+
+    emb_bytes = embedding.tobytes()
 
     cur.execute("""
         INSERT INTO embeddings (student_id, name, angle, embedding, image)
@@ -98,15 +105,30 @@ def fetch_all_embeddings():
 
     cur.execute("SELECT student_id, name, angle, embedding FROM embeddings")
     rows = cur.fetchall()
-
     conn.close()
 
     result = []
     for r in rows:
+        if r[3] is None:
+            continue
         emb = np.frombuffer(r[3], dtype=np.float32)
         result.append((r[0], r[1], r[2], emb))
 
     return result
+
+def get_students():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT DISTINCT student_id, name, first_name, last_name, mobile, email, gender, role
+        FROM embeddings
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return rows
 
 
 

@@ -5,7 +5,8 @@ import cv2
 import os
 import threading
 
-
+from torch import cosine_similarity
+from src.db.database import get_students
 from src.services.face_service import FaceService
 from src.db.database import fetch_all_embeddings, save_attendance
 from src.schemas.face_schema import EnrollSchema, ImageSchema
@@ -13,6 +14,7 @@ from src.services.attendance_service import mark_attendance, get_current_lecture
 from src.db.database import get_conn
 from src.schemas.face_schema import EnrollSchema
 from fastapi import APIRouter
+from collections import defaultdict
 
 router = APIRouter()
 
@@ -78,263 +80,302 @@ def is_already_registered(new_emb):
 
     return False
 
+def is_good_face(face, landmarks):
+
+    # 🔥 blur (loose karo)
+    blur = cv2.Laplacian(face, cv2.CV_64F).var()
+    print("BLUR:", blur)
+
+    if blur < 30:   # ❌ 60 → ✅ 30
+        return False
+
+    # 🔥 size check
+    h, w = face.shape[:2]
+    if w < 80 or h < 80:   # ❌ 100 → ✅ 80
+        return False
+
+    # # 🔥 eye alignment (loose karo)
+    # left_eye = (landmarks[5], landmarks[6])
+    # right_eye = (landmarks[7], landmarks[8])
+
+    # eye_diff = abs(left_eye[1] - right_eye[1])
+    # print("EYE DIFF:", eye_diff)
+
+    # if eye_diff > 35:   # ❌ 20 → ✅ 35
+    #     return False
+
+    return True
+
+def cosine_similarity(a, b):
+    a = np.array(a)
+    b = np.array(b)
+
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    if denom == 0:
+        return -1.0
+
+    return float(np.dot(a, b) / denom)
+
+
+# 🔥 GLOBAL MEMORY (top of file)
+# captured_counts = {}
+
 @router.post("/enroll")
 def enroll(data: EnrollSchema):
     try:
-        print("\n========== ENROLL START ==========")
+        print("\n========== ENROLL ==========")
 
         student_id = data.face_id
         full_name = f"{data.first_name} {data.last_name}"
 
-        if not data.image:
-            return {"message": "No image provided"}
+        if not data.image or len(data.image) < 100:
+            return {"status": "RED", "message": "No image"}
+        
+        if not data.face_id or not data.first_name or not data.mobile:
+            return {"status": "RED", "message": "Fill all required fields"}
 
-        #  BASE64 FIX
-        img_data = data.image
-        if "," in img_data:
-            img_data = img_data.split(",")[1]
-
-        try:
-            img_bytes = base64.b64decode(img_data)
-        except Exception as e:
-            print(" BASE64 ERROR:", e)
-            return {"message": "Invalid image format"}
-
-        np_arr = np.frombuffer(img_bytes, np.uint8)
-        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-        if frame is None or frame.size == 0:
-            print(" Frame decode failed")
-            return {"message": "Invalid image"}
-
-        print(" Frame shape:", frame.shape)
-
-        #  FACE DETECT
-        faces = face_service.detect_faces(frame)
-
-        if faces is None or len(faces) == 0:
-            print(" No face detected")
-            return {"message": "No face detected"}
-
-        print(" Faces found:", len(faces))
-
-        #  DUPLICATE ID CHECK
-        existing = fetch_all_embeddings()
-        already_id = any(sid == student_id for sid, _, _, _ in existing)
-
-        if already_id:
-            return {"message": "ID already exists"}
-
-        #   ONLY ONE FACE (FIXED)
-        f = faces[0]
-
-        x, y, w, h = map(int, f[:4])
-
-        h_img, w_img = frame.shape[:2]
-
-        x1 = max(0, x)
-        y1 = max(0, y)
-        x2 = min(w_img, x + w)
-        y2 = min(h_img, y + h)
-
-        face_crop = frame[y1:y2, x1:x2]
-
-        if face_crop.size == 0:
-            return {"message": "Face crop failed"}
-
-        #  EMBEDDING
-        emb = face_service.embedding_from_crop(frame, f)
-
-        if emb is None or emb.size == 0:
-            return {"message": "Bad face"}
-
-        #  FACE DUPLICATE CHECK
-        if is_already_registered(emb):
-            return {"message": "Face already registered"}
-
-        emb_bytes = emb.astype(np.float32).tobytes()
-
-        #  INSERT
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("""
-            INSERT INTO embeddings 
-            (student_id, name, angle, embedding, image,
-             first_name, last_name, mobile, email, gender, role)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (
-            student_id,
-            full_name,
-            "front",
-            emb_bytes,
-            img_bytes,
-            data.first_name,
-            data.last_name,
-            data.mobile,
-            data.email,
-            data.gender,
-            data.role
-        ))
-
-        conn.commit()
-        conn.close()
-
-        print(" ENROLL SUCCESS")
-
-        return {
-            "message": "Face enrolled successfully",
-            "role": data.role
-        }
-
-    except Exception as e:
-        print(" ENROLL ERROR:", e)
-        return {"message": "Server error"}
-
-#  UPDATE STUDENT
-@router.put("/update-student")
-def update_student(data: EnrollSchema):
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        #  decode image
-        img_data = data.image
-        if "," in img_data:
-            img_data = img_data.split(",")[1]
-
-        img_bytes = base64.b64decode(img_data)
-
-        #  re-embedding
-        np_arr = np.frombuffer(img_bytes, np.uint8)
-        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-        faces = face_service.detect_faces(frame)
-
-        if faces is None or len(faces) == 0:
-            return {"message": "No face detected"}
-
-        emb = face_service.embedding_from_crop(frame, faces[0])
-        emb_bytes = emb.astype(np.float32).tobytes()
-
-        full_name = f"{data.first_name} {data.last_name}"
-
-        #  UPDATE
-        cur.execute("""
-            UPDATE embeddings
-            SET 
-                name=%s,
-                first_name=%s,
-                last_name=%s,
-                mobile=%s,
-                email=%s,
-                gender=%s,
-                role=%s,
-                image=%s,
-                embedding=%s
-            WHERE student_id=%s
-        """, (
-            full_name,
-            data.first_name,
-            data.last_name,
-            data.mobile,
-            data.email,
-            data.gender,
-            data.role,
-            img_bytes,
-            emb_bytes,
-            data.face_id
-        ))
-
-        conn.commit()
-        conn.close()
-
-        return {"message": "Student updated successfully"}
-
-    except Exception as e:
-        print("UPDATE ERROR:", e)
-        return {"message": "Update failed"}
-
-#  RECOGNIZE
-@router.post("/recognize")
-def recognize(data: ImageSchema):
-
-    try:
-        print("\n========== NEW REQUEST ==========")
-
-        img_data = data.image
-
-        if "," in img_data:
-            img_data = img_data.split(",")[1]
-
+        # decode
+        img_data = data.image.split(",")[1]
         img_bytes = base64.b64decode(img_data)
 
         np_arr = np.frombuffer(img_bytes, np.uint8)
         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
         if frame is None:
-            print("Frame decode failed")
-            return {"faces": []}
+            return {"status": "RED", "message": "Invalid image"}
 
-        frame = cv2.resize(frame, (640, 480))
+        faces = face_service.detect_faces(frame)
+        if faces is None or len(faces) == 0:
+            return {"status": "RED", "message": "No face"}
 
-        if cv2.Laplacian(frame, cv2.CV_64F).var() < 50:
-            print("Blurry frame skipped")
-            return {"faces": []}
+        x, y, w, h = map(int, faces[0][:4])
+        face_crop = frame[y:y+h, x:x+w]
+        if face_crop.size == 0:
+            return {"status": "RED", "message": "Bad face"}
+
+        # embedding
+        h, w = face_crop.shape[:2]
+        emb = face_service.embedding_from_crop(face_crop, [0, 0, w, h])
+        if emb is None or len(emb) == 0:
+            return {"status": "RED", "message": "Embedding failed"}
+
+        emb = np.array(emb, dtype=np.float32)
+        norm = np.linalg.norm(emb)
+        if norm == 0:
+            return {"status": "RED", "message": "Bad embedding"}
+
+        emb = emb / norm
+        emb_bytes = emb.tobytes()
+        
+        rows = fetch_all_embeddings()
+
+        for sid, name, angle, db_emb in rows:
+         sim = cosine_similarity(emb, db_emb)
+
+         if sim > 0.75 and sid != student_id:
+          return {
+            "status": "RED",
+            "message": "Face already registered with another ID"
+        }
+
+        conn = get_conn()
+        cur = conn.cursor()
+
+        # 🔥 DB COUNT CHECK
+        cur.execute("SELECT COUNT(*) FROM embeddings WHERE student_id=%s", (student_id,))
+        count = cur.fetchone()[0]
+
+        if count >= 5:
+            conn.close()
+            return {"status": "DONE", "message": "Face Added Successfully"}
+
+        # insert
+        cur.execute("""
+            INSERT INTO embeddings 
+            (student_id, name, angle, embedding, image,
+             first_name, last_name, mobile, email, gender, role)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            student_id, full_name, "auto", emb_bytes, img_bytes,
+            data.first_name, data.last_name, data.mobile,
+            data.email, data.gender, data.role
+        ))
+
+        conn.commit()
+        conn.close()
+
+        count += 1
+        print("COUNT:", count)
+
+        return {"status": "GREEN", "count": count}
+
+    except Exception as e:
+        print("ENROLL ERROR:", e)
+        return {"status": "RED", "message": "Server error"}
+
+@router.put("/update-student")
+def update_student(data: EnrollSchema):
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        full_name = f"{data.first_name} {data.last_name}"
+
+        # 🔥 WITHOUT IMAGE UPDATE
+        if not data.image:
+            cur.execute("""
+                UPDATE embeddings
+                SET 
+                    name=%s,
+                    first_name=%s,
+                    last_name=%s,
+                    mobile=%s,
+                    email=%s,
+                    gender=%s,
+                    role=%s
+                WHERE student_id=%s
+            """, (
+                full_name,
+                data.first_name,
+                data.last_name,
+                data.mobile,
+                data.email,
+                data.gender,
+                data.role,
+                data.face_id
+            ))
+
+        else:
+            # 🔥 WITH IMAGE UPDATE
+            img_data = data.image.split(",")[1]
+            img_bytes = base64.b64decode(img_data)
+
+            np_arr = np.frombuffer(img_bytes, np.uint8)
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+            faces = face_service.detect_faces(frame)
+
+            if faces is None or len(faces) == 0:
+                return {"success": False, "message": "No face"}
+
+            f = faces[0]
+            x, y, w, h = map(int, f[:4])
+            face_crop = frame[y:y+h, x:x+w]
+
+            h, w = face_crop.shape[:2]
+            fake_box = [0, 0, w, h]
+
+            emb = face_service.embedding_from_crop(face_crop, fake_box)
+
+            emb = np.array(emb, dtype=np.float32)
+            emb = emb / np.linalg.norm(emb)
+
+            emb_bytes = emb.tobytes()
+
+            cur.execute("""
+                UPDATE embeddings
+                SET 
+                    name=%s,
+                    first_name=%s,
+                    last_name=%s,
+                    mobile=%s,
+                    email=%s,
+                    gender=%s,
+                    role=%s,
+                    image=%s,
+                    embedding=%s
+                WHERE student_id=%s
+            """, (
+                full_name,
+                data.first_name,
+                data.last_name,
+                data.mobile,
+                data.email,
+                data.gender,
+                data.role,
+                img_bytes,
+                emb_bytes,
+                data.face_id
+            ))
+
+        conn.commit()
+        conn.close()
+
+        return {"success": True}
+
+    except Exception as e:
+        print("UPDATE ERROR:", e)
+        return {"success": False}
+
+#  RECOGNIZE
+@router.post("/recognize")
+def recognize(data: ImageSchema):
+    try:
+        img_data = data.image.split(",")[1]
+        img_bytes = base64.b64decode(img_data)
+
+        np_arr = np.frombuffer(img_bytes, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
         faces = face_service.detect_faces(frame)
 
         if faces is None or len(faces) == 0:
-            print("No faces detected")
             return {"faces": []}
 
-        face = faces[0]
+        f = faces[0]
+        x, y, w, h = map(int, f[:4])
+        face_crop = frame[y:y+h, x:x+w]
 
-        emb = face_service.embedding_from_crop(frame, face)
+        h, w = face_crop.shape[:2]
+        emb = face_service.embedding_from_crop(face_crop, [0,0,w,h])
 
-        if emb is None or emb.size == 0:
-            print("Invalid embedding")
+        if emb is None or len(emb) == 0:
             return {"faces": []}
 
-        x, y, w, h = map(int, face[:4])
+        emb = np.array(emb, dtype=np.float32)
+        emb = emb / np.linalg.norm(emb)
 
-        face_img = frame[y:y+h, x:x+w]
+        # 🔥 FETCH DB
+        rows = fetch_all_embeddings()
 
-        if face_img.size == 0:
+        if not rows:
             return {"faces": []}
 
-        success, buffer = cv2.imencode(".jpg", face_img)
+        # 🔥 GROUP BY STUDENT
+        grouped = defaultdict(list)
 
-        if not success:
+        for sid, name, angle, db_emb in rows:
+            grouped[(sid, name)].append(db_emb)
+
+        best_score = -1
+        best_match = None
+
+        # 🔥 COMPARE
+        for (sid, name), emb_list in grouped.items():
+            scores = []
+
+            for db_emb in emb_list:
+                sim = cosine_similarity(emb, db_emb)
+                scores.append(sim)
+
+            avg_score = sum(scores) / len(scores)
+
+            if avg_score > best_score:
+                best_score = avg_score
+                best_match = (sid, name)
+
+        print("BEST SCORE:", best_score)
+
+        # 🔥 THRESHOLD (IMPORTANT)
+        if best_score < 0.45:
             return {"faces": []}
-
-        capture_bytes = buffer.tobytes()
-
-        img_base64 = base64.b64encode(capture_bytes).decode("utf-8")
-
-        #  MATCH FIRST (IMPORTANT)
-        student_id, name, score = match_face(emb)
-
-        print("MATCH RESULT:", student_id, name, score)
-
-        #  SAFE CHECK
-        if student_id is not None and score > 0.65:
-
-            print("MATCH FOUND:", student_id)
-
-            save_attendance(student_id, name, capture_bytes)
-
-        else:
-            name = "Unknown"
-            student_id = None
 
         return {
             "faces": [{
-                "student_id": student_id,
-                "name": name,
-                "score": float(round(score, 3)),
-                "box": [x, y, w, h],
-                "image": img_base64
+                "student_id": best_match[0],
+                "name": best_match[1],
+                "score": float(best_score),
+                "box": [int(x), int(y), int(w), int(h)]
             }]
         }
 
