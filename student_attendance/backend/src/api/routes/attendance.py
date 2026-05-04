@@ -5,17 +5,11 @@ from datetime import datetime
 from src.db.database import get_conn
 from pydantic import BaseModel
 from src.schemas.attendance import AttendanceIn
-
-
-    
+   
 router = APIRouter()   
-
 router = APIRouter(prefix="/attendance")
 
-
-# ===============================
-# 🔵 STUDENT ATTENDANCE
-# ===============================
+# STUDENT ATTENDANCE
 @router.get("/student")
 def student_attendance():
     try:
@@ -40,7 +34,7 @@ def student_attendance():
 
         data = cur.fetchall()
 
-        # 🔥 BASE64 FIX
+        #  BASE64 FIX
         for row in data:
             if row.get("enroll_image"):
                 row["enroll_image"] = base64.b64encode(row["enroll_image"]).decode("utf-8")
@@ -59,10 +53,7 @@ def student_attendance():
         print("STUDENT ERROR:", e)
         return []
 
-
-# ===============================
-# 🟢 TEACHER ATTENDANCE
-# ===============================
+# TEACHER ATTENDANCE
 @router.get("/teacher")
 def teacher_attendance():
     try:
@@ -87,7 +78,7 @@ def teacher_attendance():
 
         data = cur.fetchall()
 
-        # 🔥 BASE64 FIX
+        #  BASE64 FIX
         for row in data:
             if row.get("enroll_image"):
                 row["enroll_image"] = base64.b64encode(row["enroll_image"]).decode("utf-8")
@@ -112,7 +103,7 @@ def mark_attendance(data: AttendanceIn):
         student_id = data.student_id
         name = data.name
 
-        # 🔥 SAFE IMAGE HANDLE
+        #  SAFE IMAGE HANDLE
         capture_bytes = None
         if data.capture_image and "," in data.capture_image:
             img_data = data.capture_image.split(",")[1]
@@ -120,7 +111,6 @@ def mark_attendance(data: AttendanceIn):
 
         conn = get_conn()
         cur = conn.cursor()
-
         now = datetime.now()
 
         # duplicate check
@@ -158,17 +148,15 @@ def mark_attendance(data: AttendanceIn):
         conn.commit()
         conn.close()
 
-        print("✅ ATTENDANCE SAVED:", student_id)
+        print(" ATTENDANCE SAVED:", student_id)
 
         return {"success": True}
 
     except Exception as e:
-        print("❌ ERROR:", e)
-        return {"success": False, "error": str(e)}  # 🔥 IMPORTANT
+        print(" ERROR:", e)
+        return {"success": False, "error": str(e)}  #  IMPORTANT
 
-# ===============================
-# 👤 ALL STUDENTS
-# ===============================
+# ALL STUDENTS
 @router.get("/students")
 def get_students():
     return fetch_students()

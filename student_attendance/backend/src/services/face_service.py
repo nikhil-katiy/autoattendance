@@ -1,9 +1,9 @@
 import cv2
 import numpy as np
 import torch
+import threading
 from facenet_pytorch import InceptionResnetV1
 from pathlib import Path
-import threading
 
 class FaceService:
     def __init__(self, model_path):

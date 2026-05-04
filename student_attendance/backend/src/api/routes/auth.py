@@ -6,7 +6,9 @@ from fastapi import APIRouter, HTTPException
 from src.schemas.auth_schema import RegisterSchema, LoginSchema
 from src.utils.hash import hash_password, verify_password
 from src.utils.hash import verify_password
-
+from fastapi import Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import jwt, JWTError
 
 router = APIRouter()
 
@@ -77,9 +79,7 @@ def login(user: LoginSchema):
         if conn:
             conn.close()
             
-            from fastapi import Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import jwt, JWTError
+            
 
 security = HTTPBearer()
 

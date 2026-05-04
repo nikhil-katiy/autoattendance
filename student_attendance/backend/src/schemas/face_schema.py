@@ -1,7 +1,4 @@
 from pydantic import BaseModel
-
-from typing import Optional
-
 from typing import Optional
 
 class EnrollSchema(BaseModel):
@@ -12,7 +9,7 @@ class EnrollSchema(BaseModel):
     email: str
     gender: str
     role: str
-    image: Optional[str] = None   # 🔥 FIX
+    image: Optional[str] = None   #  FIX
 
 #  RECOGNIZE
 class ImageSchema(BaseModel):

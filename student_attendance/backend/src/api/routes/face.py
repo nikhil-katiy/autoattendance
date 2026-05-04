@@ -1,9 +1,9 @@
-
 import base64
 import numpy as np
 import cv2
 import os
 import threading
+import time
 
 from torch import cosine_similarity
 from src.db.database import get_students
@@ -15,6 +15,7 @@ from src.db.database import get_conn
 from src.schemas.face_schema import EnrollSchema
 from fastapi import APIRouter
 from collections import defaultdict
+from collections import deque
 
 router = APIRouter()
 
@@ -26,6 +27,32 @@ print("MODEL PATH:", MODEL_PATH)
 print("EXISTS:", os.path.exists(MODEL_PATH))
 
 face_service = FaceService(MODEL_PATH)
+
+# angle_store = {}  # {student_id: {"angles": [], "count": 0}}
+
+# required_angles = ["front", "left", "right", "up", "down"]
+
+angle_buffer = deque(maxlen=5)
+
+required_angles = {"front", "left", "right", "up", "down"}
+
+angle_store = {}  # {student_id: set(angles)}
+angle_store_baseline = {}   # ✅ add this
+
+last_capture_time = 0
+
+def get_face_angle(landmarks, student_id):
+    left_eye = landmarks[0]
+    right_eye = landmarks[1]
+
+    dx = right_eye[0] - left_eye[0]
+
+    if dx > 30:
+        return "right"
+    elif dx < -30:
+        return "left"
+    else:
+        return "front"
 
 
 #  MATCH FUNCTION (FIXED - OUTSIDE)
@@ -82,59 +109,108 @@ def is_already_registered(new_emb):
 
 def is_good_face(face, landmarks):
 
-    # 🔥 blur (loose karo)
+    #  blur (loose karo)
     blur = cv2.Laplacian(face, cv2.CV_64F).var()
     print("BLUR:", blur)
 
-    if blur < 30:   # ❌ 60 → ✅ 30
+    if blur < 30:   #  60 →  30
         return False
 
-    # 🔥 size check
+    #  size check
     h, w = face.shape[:2]
-    if w < 80 or h < 80:   # ❌ 100 → ✅ 80
+    if w < 80 or h < 80:   #  100 →  80
         return False
 
-    # # 🔥 eye alignment (loose karo)
+    # #  eye alignment (loose karo)
     # left_eye = (landmarks[5], landmarks[6])
     # right_eye = (landmarks[7], landmarks[8])
 
     # eye_diff = abs(left_eye[1] - right_eye[1])
     # print("EYE DIFF:", eye_diff)
 
-    # if eye_diff > 35:   # ❌ 20 → ✅ 35
+    # if eye_diff > 35:   #  20 → ✅ 35
     #     return False
 
     return True
 
 def cosine_similarity(a, b):
-    a = np.array(a)
-    b = np.array(b)
-
     denom = np.linalg.norm(a) * np.linalg.norm(b)
     if denom == 0:
         return -1.0
-
     return float(np.dot(a, b) / denom)
 
 
-# 🔥 GLOBAL MEMORY (top of file)
-# captured_counts = {}
+def get_face_angle(landmarks, student_id):
+    left_eye = landmarks[0]
+    right_eye = landmarks[1]
+    nose = landmarks[2]
+    left_mouth = landmarks[3]
+    right_mouth = landmarks[4]
+
+    eye_center_x = (left_eye[0] + right_eye[0]) / 2
+    eye_center_y = (left_eye[1] + right_eye[1]) / 2
+
+    dx = right_eye[0] - left_eye[0]
+    dx_nose = nose[0] - eye_center_x
+
+    face_width = abs(dx) + 1
+    dx_ratio = dx_nose / (face_width * 0.5)
+
+    mouth_y = (left_mouth[1] + right_mouth[1]) / 2
+    face_height = abs(mouth_y - eye_center_y) + 1
+
+    dy_ratio = (nose[1] - eye_center_y) / face_height
+
+    # baseline
+    if student_id not in angle_store_baseline:
+        angle_store_baseline[student_id] = dy_ratio
+
+    base = angle_store_baseline[student_id]
+    delta = dy_ratio - base
+
+    # 🎯 FRONT (tight)
+    if abs(delta) < 0.025 and abs(dx_ratio) < 0.08:
+        return "front"
+
+    # 🎯 AXIS DECISION (vertical ko edge)
+    if abs(delta) > abs(dx_ratio) * 0.8:
+        if delta < -0.035:
+            return "up"
+        elif delta > 0.05:
+            return "down"
+    else:
+        if dx_ratio > 0.18:
+            return "right"
+        elif dx_ratio < -0.18:
+            return "left"
+
+    return "front"
+
+
+def get_stable_angle(new_angle):
+    angle_buffer.append(new_angle)
+
+    # initial frames → raw use karo
+    if len(angle_buffer) < 3:
+        return new_angle
+
+    return max(set(angle_buffer), key=angle_buffer.count)
+
+
 
 @router.post("/enroll")
 def enroll(data: EnrollSchema):
     try:
-        print("\n========== ENROLL ==========")
-
         student_id = data.face_id
         full_name = f"{data.first_name} {data.last_name}"
 
         if not data.image or len(data.image) < 100:
             return {"status": "RED", "message": "No image"}
-        
+
         if not data.face_id or not data.first_name or not data.mobile:
             return {"status": "RED", "message": "Fill all required fields"}
 
-        # decode
+        # decode image
         img_data = data.image.split(",")[1]
         img_bytes = base64.b64decode(img_data)
 
@@ -148,7 +224,29 @@ def enroll(data: EnrollSchema):
         if faces is None or len(faces) == 0:
             return {"status": "RED", "message": "No face"}
 
-        x, y, w, h = map(int, faces[0][:4])
+        face = faces[0]
+        x, y, w, h = map(int, face[:4])
+        landmarks = np.array(face[4:14]).reshape((5, 2))
+        print("LANDMARKS:", landmarks)
+
+        # angle detection
+        raw_angle = get_face_angle(landmarks, student_id)
+        print("ANGLE:", raw_angle)
+        current_angle = raw_angle
+
+        # init store
+        if student_id not in angle_store:
+            angle_store[student_id] = []
+
+        # prevent duplicate angle
+        if current_angle in angle_store[student_id]:
+            remaining = list(required_angles - set(angle_store[student_id]))
+            return {
+                "status": "WAIT",
+                "message": f"{current_angle} already done",
+                "next": remaining
+            }
+
         face_crop = frame[y:y+h, x:x+w]
         if face_crop.size == 0:
             return {"status": "RED", "message": "Bad face"}
@@ -156,32 +254,27 @@ def enroll(data: EnrollSchema):
         # embedding
         h, w = face_crop.shape[:2]
         emb = face_service.embedding_from_crop(face_crop, [0, 0, w, h])
+
         if emb is None or len(emb) == 0:
             return {"status": "RED", "message": "Embedding failed"}
 
         emb = np.array(emb, dtype=np.float32)
-        norm = np.linalg.norm(emb)
-        if norm == 0:
-            return {"status": "RED", "message": "Bad embedding"}
-
-        emb = emb / norm
+        emb = emb / np.linalg.norm(emb)
         emb_bytes = emb.tobytes()
-        
+
+        # duplicate face check
         rows = fetch_all_embeddings()
-
         for sid, name, angle, db_emb in rows:
-         sim = cosine_similarity(emb, db_emb)
-
-         if sim > 0.75 and sid != student_id:
-          return {
-            "status": "RED",
-            "message": "Face already registered with another ID"
-        }
+            sim = cosine_similarity(emb, db_emb)
+            if sim > 0.75 and sid != student_id:
+                return {
+                    "status": "RED",
+                    "message": "Face already registered with another ID"
+                }
 
         conn = get_conn()
         cur = conn.cursor()
 
-        # 🔥 DB COUNT CHECK
         cur.execute("SELECT COUNT(*) FROM embeddings WHERE student_id=%s", (student_id,))
         count = cur.fetchone()[0]
 
@@ -189,14 +282,14 @@ def enroll(data: EnrollSchema):
             conn.close()
             return {"status": "DONE", "message": "Face Added Successfully"}
 
-        # insert
+        # save
         cur.execute("""
             INSERT INTO embeddings 
             (student_id, name, angle, embedding, image,
              first_name, last_name, mobile, email, gender, role)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
-            student_id, full_name, "auto", emb_bytes, img_bytes,
+            student_id, full_name, current_angle, emb_bytes, img_bytes,
             data.first_name, data.last_name, data.mobile,
             data.email, data.gender, data.role
         ))
@@ -204,10 +297,18 @@ def enroll(data: EnrollSchema):
         conn.commit()
         conn.close()
 
-        count += 1
-        print("COUNT:", count)
+        # update store
+        angle_store[student_id].append(current_angle)
 
-        return {"status": "GREEN", "count": count}
+        count += 1
+        remaining = list(required_angles - set(angle_store[student_id]))
+
+        return {
+            "status": "GREEN",
+            "count": count,
+            "angle": current_angle,
+            "remaining": remaining
+        }
 
     except Exception as e:
         print("ENROLL ERROR:", e)
@@ -221,7 +322,7 @@ def update_student(data: EnrollSchema):
 
         full_name = f"{data.first_name} {data.last_name}"
 
-        # 🔥 WITHOUT IMAGE UPDATE
+        #  WITHOUT IMAGE UPDATE
         if not data.image:
             cur.execute("""
                 UPDATE embeddings
@@ -246,7 +347,7 @@ def update_student(data: EnrollSchema):
             ))
 
         else:
-            # 🔥 WITH IMAGE UPDATE
+            #  WITH IMAGE UPDATE
             img_data = data.image.split(",")[1]
             img_bytes = base64.b64decode(img_data)
 
@@ -335,13 +436,13 @@ def recognize(data: ImageSchema):
         emb = np.array(emb, dtype=np.float32)
         emb = emb / np.linalg.norm(emb)
 
-        # 🔥 FETCH DB
+        #  FETCH DB
         rows = fetch_all_embeddings()
 
         if not rows:
             return {"faces": []}
 
-        # 🔥 GROUP BY STUDENT
+        #  GROUP BY STUDENT
         grouped = defaultdict(list)
 
         for sid, name, angle, db_emb in rows:
@@ -350,7 +451,7 @@ def recognize(data: ImageSchema):
         best_score = -1
         best_match = None
 
-        # 🔥 COMPARE
+        #  COMPARE
         for (sid, name), emb_list in grouped.items():
             scores = []
 
@@ -366,7 +467,7 @@ def recognize(data: ImageSchema):
 
         print("BEST SCORE:", best_score)
 
-        # 🔥 THRESHOLD (IMPORTANT)
+        #  THRESHOLD (IMPORTANT)
         if best_score < 0.45:
             return {"faces": []}
 
@@ -382,3 +483,28 @@ def recognize(data: ImageSchema):
     except Exception as e:
         print("RECOGNIZE ERROR:", e)
         return {"faces": []}
+    
+@router.get("/enroll-images/{student_id}")
+def get_enroll_images(student_id: str):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT image, angle FROM embeddings WHERE student_id=%s",
+        (student_id,)
+    )
+
+    rows = cur.fetchall()
+
+    import base64
+
+    result = []
+    for img, angle in rows:
+        base64_img = base64.b64encode(img).decode("utf-8")
+
+        result.append({
+            "angle": angle,
+            "image": f"data:image/jpeg;base64,{base64_img}"
+        })
+
+    return result

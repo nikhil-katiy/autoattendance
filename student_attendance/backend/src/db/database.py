@@ -81,7 +81,7 @@ def insert_embedding(student_id, name, angle, embedding, image_bytes):
     conn = get_conn()
     cur = conn.cursor()
 
-    # 🔥 FIX: ensure numpy
+    #  FIX: ensure numpy
     embedding = np.array(embedding)
 
     norm = np.linalg.norm(embedding)
