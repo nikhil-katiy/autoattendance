@@ -5,6 +5,7 @@ import os
 import threading
 import time
 
+from pydantic import BaseModel
 from torch import cosine_similarity
 from src.db.database import get_students
 from src.services.face_service import FaceService
@@ -16,6 +17,11 @@ from src.schemas.face_schema import EnrollSchema
 from fastapi import APIRouter
 from collections import defaultdict
 from collections import deque
+from fastapi import BackgroundTasks
+from src.services.email_service import send_attendance_email
+from src.services.attendance_service import already_marked_today, mark_attendance
+from src.services.attendance_service import save_attendance
+from src.services.telegram_service import send_telegram_message
 
 router = APIRouter()
 
@@ -28,16 +34,15 @@ print("EXISTS:", os.path.exists(MODEL_PATH))
 
 face_service = FaceService(MODEL_PATH)
 
-# angle_store = {}  # {student_id: {"angles": [], "count": 0}}
 
-# required_angles = ["front", "left", "right", "up", "down"]
-
+# GLOBALS
 angle_buffer = deque(maxlen=5)
 
 required_angles = {"front", "left", "right", "up", "down"}
 
 angle_store = {}  # {student_id: set(angles)}
-angle_store_baseline = {}   # ✅ add this
+angle_store_baseline = {}   #  add this
+enroll_queue = ()
 
 last_capture_time = 0
 
@@ -54,9 +59,7 @@ def get_face_angle(landmarks, student_id):
     else:
         return "front"
 
-
 #  MATCH FUNCTION (FIXED - OUTSIDE)
-
 def match_face(query_emb):
     rows = fetch_all_embeddings()
 
@@ -90,8 +93,6 @@ def match_face(query_emb):
 
     return None, "Unknown", float(best_score)
 
-#  ADD HERE (enroll ke upar)
-
 def is_already_registered(new_emb):
     rows = fetch_all_embeddings()
 
@@ -120,17 +121,6 @@ def is_good_face(face, landmarks):
     h, w = face.shape[:2]
     if w < 80 or h < 80:   #  100 →  80
         return False
-
-    # #  eye alignment (loose karo)
-    # left_eye = (landmarks[5], landmarks[6])
-    # right_eye = (landmarks[7], landmarks[8])
-
-    # eye_diff = abs(left_eye[1] - right_eye[1])
-    # print("EYE DIFF:", eye_diff)
-
-    # if eye_diff > 35:   #  20 → ✅ 35
-    #     return False
-
     return True
 
 def cosine_similarity(a, b):
@@ -138,7 +128,6 @@ def cosine_similarity(a, b):
     if denom == 0:
         return -1.0
     return float(np.dot(a, b) / denom)
-
 
 def get_face_angle(landmarks, student_id):
     left_eye = landmarks[0]
@@ -168,16 +157,16 @@ def get_face_angle(landmarks, student_id):
     base = angle_store_baseline[student_id]
     delta = dy_ratio - base
 
-    # 🎯 FRONT (tight)
+    #  FRONT (tight)
     if abs(delta) < 0.025 and abs(dx_ratio) < 0.08:
         return "front"
 
-    # 🎯 AXIS DECISION (vertical ko edge)
+    #  AXIS DECISION (vertical ko edge)
     if abs(delta) > abs(dx_ratio) * 0.8:
-        if delta < -0.035:
-            return "up"
-        elif delta > 0.05:
-            return "down"
+        if delta < -0.06:   #  UP strict 
+         return "up"
+        elif delta > 0.03:  #  DOWN easy
+         return "down"
     else:
         if dx_ratio > 0.18:
             return "right"
@@ -185,7 +174,6 @@ def get_face_angle(landmarks, student_id):
             return "left"
 
     return "front"
-
 
 def get_stable_angle(new_angle):
     angle_buffer.append(new_angle)
@@ -196,7 +184,10 @@ def get_stable_angle(new_angle):
 
     return max(set(angle_buffer), key=angle_buffer.count)
 
-
+#  GLOBAL (top of file)
+enroll_queue = {}
+angle_store = {}
+required_angles = {"front", "left", "right", "up", "down"}
 
 @router.post("/enroll")
 def enroll(data: EnrollSchema):
@@ -204,13 +195,14 @@ def enroll(data: EnrollSchema):
         student_id = data.face_id
         full_name = f"{data.first_name} {data.last_name}"
 
+        # VALIDATION
         if not data.image or len(data.image) < 100:
             return {"status": "RED", "message": "No image"}
 
         if not data.face_id or not data.first_name or not data.mobile:
             return {"status": "RED", "message": "Fill all required fields"}
 
-        # decode image
+        # IMAGE DECODE
         img_data = data.image.split(",")[1]
         img_bytes = base64.b64decode(img_data)
 
@@ -220,6 +212,7 @@ def enroll(data: EnrollSchema):
         if frame is None:
             return {"status": "RED", "message": "Invalid image"}
 
+        # FACE DETECT
         faces = face_service.detect_faces(frame)
         if faces is None or len(faces) == 0:
             return {"status": "RED", "message": "No face"}
@@ -227,31 +220,32 @@ def enroll(data: EnrollSchema):
         face = faces[0]
         x, y, w, h = map(int, face[:4])
         landmarks = np.array(face[4:14]).reshape((5, 2))
-        print("LANDMARKS:", landmarks)
 
-        # angle detection
-        raw_angle = get_face_angle(landmarks, student_id)
-        print("ANGLE:", raw_angle)
-        current_angle = raw_angle
+        # ANGLE DETECT
+        current_angle = get_face_angle(landmarks, student_id)
 
-        # init store
+        # INIT STORE
         if student_id not in angle_store:
             angle_store[student_id] = []
 
-        # prevent duplicate angle
-        if current_angle in angle_store[student_id]:
-            remaining = list(required_angles - set(angle_store[student_id]))
+        if student_id not in enroll_queue:
+            enroll_queue[student_id] = []
+
+        # DUPLICATE ANGLE BLOCK
+        if current_angle in [i["angle"] for i in enroll_queue[student_id]]:
+            remaining = list(required_angles - set([i["angle"] for i in enroll_queue[student_id]]))
             return {
                 "status": "WAIT",
                 "message": f"{current_angle} already done",
                 "next": remaining
             }
 
+        # FACE CROP
         face_crop = frame[y:y+h, x:x+w]
         if face_crop.size == 0:
             return {"status": "RED", "message": "Bad face"}
 
-        # embedding
+        # EMBEDDING
         h, w = face_crop.shape[:2]
         emb = face_service.embedding_from_crop(face_crop, [0, 0, w, h])
 
@@ -261,58 +255,105 @@ def enroll(data: EnrollSchema):
         emb = np.array(emb, dtype=np.float32)
         emb = emb / np.linalg.norm(emb)
         emb_bytes = emb.tobytes()
-
-        # duplicate face check
+        
+        # DUPLICATE FACE CHECK (DB)
         rows = fetch_all_embeddings()
         for sid, name, angle, db_emb in rows:
             sim = cosine_similarity(emb, db_emb)
             if sim > 0.75 and sid != student_id:
                 return {
                     "status": "RED",
-                    "message": "Face already registered with another ID"
+                    "message": "Face already registered"
                 }
 
-        conn = get_conn()
-        cur = conn.cursor()
+        #  STORE IN QUEUE (NOT DB)
+        enroll_queue[student_id].append({
+            "angle": current_angle,
+            "embedding": emb_bytes,
+            "image": img_bytes,
+            "data": data
+        })
 
-        cur.execute("SELECT COUNT(*) FROM embeddings WHERE student_id=%s", (student_id,))
-        count = cur.fetchone()[0]
-
-        if count >= 5:
-            conn.close()
-            return {"status": "DONE", "message": "Face Added Successfully"}
-
-        # save
-        cur.execute("""
-            INSERT INTO embeddings 
-            (student_id, name, angle, embedding, image,
-             first_name, last_name, mobile, email, gender, role)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (
-            student_id, full_name, current_angle, emb_bytes, img_bytes,
-            data.first_name, data.last_name, data.mobile,
-            data.email, data.gender, data.role
-        ))
-
-        conn.commit()
-        conn.close()
-
-        # update store
         angle_store[student_id].append(current_angle)
 
-        count += 1
-        remaining = list(required_angles - set(angle_store[student_id]))
+        #  IF 5 ANGLES COMPLETE → SAVE DB
+        if len(enroll_queue[student_id]) == 5:
 
+            conn = get_conn()
+            cur = conn.cursor()
+
+            for item in enroll_queue[student_id]:
+                d = item["data"]
+
+                cur.execute("""
+                    INSERT INTO embeddings 
+                    (student_id, name, angle, embedding, image,
+                     first_name, last_name, mobile, email, gender, role)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (
+                    student_id,
+                    f"{d.first_name} {d.last_name}",
+                    item["angle"],
+                    item["embedding"],
+                    item["image"],
+                    d.first_name,
+                    d.last_name,
+                    d.mobile,
+                    d.email,
+                    d.gender,
+                    d.role
+                ))
+
+            conn.commit()
+            conn.close()
+
+            # clear queue
+            del enroll_queue[student_id]
+            angle_store.pop(student_id, None)
+
+            return {
+                "status": "DONE",
+                "message": "Enrollment Successful"
+            }
+
+        # NORMAL RESPONSE
         return {
-            "status": "GREEN",
-            "count": count,
+            "status": "CAPTURED",
             "angle": current_angle,
-            "remaining": remaining
+            "count": len(enroll_queue[student_id]),
+            "remaining": list(required_angles - set([i["angle"] for i in enroll_queue[student_id]]))
         }
 
     except Exception as e:
         print("ENROLL ERROR:", e)
         return {"status": "RED", "message": "Server error"}
+    
+    
+
+class RemoveAngleSchema(BaseModel):
+    student_id: str
+    angle: str
+
+
+@router.post("/remove-angle")
+def remove_angle(data: RemoveAngleSchema):
+    student_id = data.student_id
+    angle = data.angle
+
+    if student_id in enroll_queue:
+        enroll_queue[student_id] = [
+            i for i in enroll_queue[student_id]
+            if i["angle"] != angle
+        ]
+
+    # angle_store भी update करो
+    if student_id in angle_store:
+        angle_store[student_id] = [
+            a for a in angle_store[student_id]
+            if a != angle
+        ]
+
+    return {"status": "REMOVED"}
 
 @router.put("/update-student")
 def update_student(data: EnrollSchema):
@@ -410,79 +451,255 @@ def update_student(data: EnrollSchema):
 
 #  RECOGNIZE
 @router.post("/recognize")
-def recognize(data: ImageSchema):
+def recognize(data: ImageSchema, background_tasks: BackgroundTasks):
     try:
+        print("\n========== RECOGNIZE ==========")
+
+        # =========================
+        # 🔹 DECODE IMAGE
+        # =========================
+        if not data.image or len(data.image) < 100:
+            return {
+                "status": "ERROR",
+                "message": "Invalid image",
+                "faces": []
+            }
+
         img_data = data.image.split(",")[1]
         img_bytes = base64.b64decode(img_data)
 
         np_arr = np.frombuffer(img_bytes, np.uint8)
         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
+        if frame is None:
+            return {
+                "status": "ERROR",
+                "message": "Frame decode failed",
+                "faces": []
+            }
+
+        # =========================
+        # 🔹 LIGHT CHECK
+        # =========================
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if np.mean(gray) < 50:
+            return {
+                "status": "WAIT",
+                "message": "Low light",
+                "faces": []
+            }
+
+        # =========================
+        # 🔹 DETECT FACE
+        # =========================
         faces = face_service.detect_faces(frame)
 
         if faces is None or len(faces) == 0:
-            return {"faces": []}
+            return {
+                "status": "WAIT",
+                "message": "No face detected",
+                "faces": []
+            }
 
         f = faces[0]
         x, y, w, h = map(int, f[:4])
+
+        # face size check
+        if w < 80 or h < 80:
+            return {
+                "status": "WAIT",
+                "message": "Move closer",
+                "faces": []
+            }
+
         face_crop = frame[y:y+h, x:x+w]
 
-        h, w = face_crop.shape[:2]
-        emb = face_service.embedding_from_crop(face_crop, [0,0,w,h])
+        if face_crop.size == 0:
+            return {
+                "status": "WAIT",
+                "message": "Bad face crop",
+                "faces": []
+            }
+
+        # =========================
+        # 🔹 EMBEDDING
+        # =========================
+        h_, w_ = face_crop.shape[:2]
+
+        emb = face_service.embedding_from_crop(
+            face_crop,
+            [0, 0, w_, h_]
+        )
 
         if emb is None or len(emb) == 0:
-            return {"faces": []}
+            return {
+                "status": "WAIT",
+                "message": "Embedding failed",
+                "faces": []
+            }
 
         emb = np.array(emb, dtype=np.float32)
         emb = emb / np.linalg.norm(emb)
 
-        #  FETCH DB
+        # =========================
+        # 🔹 FETCH DB
+        # =========================
         rows = fetch_all_embeddings()
 
         if not rows:
-            return {"faces": []}
+            return {
+                "status": "ERROR",
+                "message": "No data in DB",
+                "faces": []
+            }
 
-        #  GROUP BY STUDENT
+        # =========================
+        # 🔹 GROUP BY STUDENT
+        # =========================
+        from collections import defaultdict
+
         grouped = defaultdict(list)
 
         for sid, name, angle, db_emb in rows:
+
+            # only front angle
+            if angle != "front":
+                continue
+
             grouped[(sid, name)].append(db_emb)
 
+        if not grouped:
+            return {
+                "status": "ERROR",
+                "message": "No front embeddings found",
+                "faces": []
+            }
+
+        # =========================
+        # 🔹 BEST MATCH SEARCH
+        # =========================
         best_score = -1
         best_match = None
 
-        #  COMPARE
         for (sid, name), emb_list in grouped.items():
-            scores = []
 
-            for db_emb in emb_list:
-                sim = cosine_similarity(emb, db_emb)
-                scores.append(sim)
+            avg_emb = np.mean(emb_list, axis=0)
+            avg_emb = avg_emb / np.linalg.norm(avg_emb)
 
-            avg_score = sum(scores) / len(scores)
+            sim = cosine_similarity(emb, avg_emb)
 
-            if avg_score > best_score:
-                best_score = avg_score
+            print(f"[CHECK] {sid} ({name}) -> {sim:.3f}")
+
+            if sim > best_score:
+                best_score = sim
                 best_match = (sid, name)
 
+        print("BEST MATCH:", best_match)
         print("BEST SCORE:", best_score)
 
-        #  THRESHOLD (IMPORTANT)
-        if best_score < 0.45:
-            return {"faces": []}
+        # =========================
+        # 🔹 THRESHOLD
+        # =========================
+        THRESHOLD = 0.85
 
-        return {
-            "faces": [{
-                "student_id": best_match[0],
-                "name": best_match[1],
+        if best_score < THRESHOLD:
+            return {
+                "status": "UNKNOWN",
+                "message": "Face not recognized",
                 "score": float(best_score),
-                "box": [int(x), int(y), int(w), int(h)]
-            }]
-        }
+                "faces": []
+            }
+
+        # =========================
+        # 🔹 SUCCESS
+        # =========================
+        student_id = best_match[0]
+        student_name = best_match[1]
+
+        # =========================
+        # 🔹 GET EMAIL
+        # =========================
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT email FROM embeddings WHERE student_id=%s LIMIT 1",
+            (student_id,)
+        )
+
+        row = cur.fetchone()
+
+        student_email = row[0] if row else None
+
+        conn.close()
+
+        # =========================
+        # 🔹 SAVE ATTENDANCE
+        # =========================
+        result = save_attendance(
+            student_id,
+            student_name,
+            img_bytes
+        )
+
+                # =========================
+        # 🔹 SUCCESS CASE
+        # =========================
+        if result["success"]:
+
+            # send email
+            if student_email:
+                background_tasks.add_task(
+                    send_attendance_email,
+                    student_email,
+                    student_name
+                )
+
+#             # telegram message
+#             telegram_message = f"""
+# ✅ Attendance Marked
+
+# ID: {student_id}
+# Name: {student_name}
+# """
+
+#             send_telegram_message(telegram_message)
+
+            return {
+                "status": "SUCCESS",
+                "message": "Attendance marked",
+                "faces": [{
+                    "student_id": student_id,
+                    "name": student_name,
+                    "score": float(best_score),
+                    "box": [int(x), int(y), int(w), int(h)]
+                }]
+            }
+
+        # =========================
+        # 🔹 ALREADY MARKED
+        # =========================
+        else:
+            return {
+                "status": "SKIPPED",
+                "message": "Attendance already marked today",
+                "faces": [{
+                    "student_id": student_id,
+                    "name": student_name,
+                    "score": float(best_score),
+                    "box": [int(x), int(y), int(w), int(h)]
+                }]
+            }
 
     except Exception as e:
         print("RECOGNIZE ERROR:", e)
-        return {"faces": []}
+
+        return {
+            "status": "ERROR",
+            "message": "Server error",
+            "faces": []
+        }
     
 @router.get("/enroll-images/{student_id}")
 def get_enroll_images(student_id: str):
