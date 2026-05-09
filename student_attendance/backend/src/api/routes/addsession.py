@@ -6,4 +6,3 @@ router = APIRouter()
 def add_session():
     return {"message": "Session added"}
 
-# hello session add

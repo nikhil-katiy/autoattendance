@@ -12,14 +12,14 @@ def send_attendance_email(to_email, name):
 
         subject = "Attendance Marked Successfully"
         body = f"""
-Hello {name},
+        Hello {name},
 
-Your attendance has been marked successfully.
+        Your attendance has been marked successfully.
 
-Time: {current_time}
+        Time: {current_time}
 
-Thank you.
-"""
+        Thank you.
+      """
 
         msg = MIMEText(body)
         msg["Subject"] = subject

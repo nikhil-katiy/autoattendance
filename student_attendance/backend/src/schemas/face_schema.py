@@ -9,7 +9,7 @@ class EnrollSchema(BaseModel):
     email: str
     gender: str
     role: str
-    image: Optional[str] = None   #  FIX
+    image: Optional[str] = None   
 
 #  RECOGNIZE
 class ImageSchema(BaseModel):

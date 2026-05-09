@@ -209,7 +209,7 @@ def attendance_percentage_all():
     conn = get_conn()
     cur = conn.cursor(dictionary=True)
 
-    # ✅ FIXED WORKING DAYS
+    #  FIXED WORKING DAYS
     TOTAL_WORKING_DAYS = 30
 
     # student present counts
@@ -251,21 +251,13 @@ def attendance_percentage_all():
 
     return result
 
-
-
-
-from src.services.telegram_service import send_telegram_message
-
-
 @router.post("/send-telegram-report")
 def send_telegram_report():
 
     conn = get_conn()
     cur = conn.cursor(dictionary=True)
 
-    # =========================
     # ALL ENROLLED STUDENTS
-    # =========================
     cur.execute("""
         SELECT DISTINCT student_id, name
         FROM embeddings
@@ -273,9 +265,7 @@ def send_telegram_report():
 
     all_students = cur.fetchall()
 
-    # =========================
     # TODAY PRESENT STUDENTS
-    # =========================
     cur.execute("""
         SELECT DISTINCT student_id, name
         FROM attendance
@@ -285,17 +275,13 @@ def send_telegram_report():
 
     present_students = cur.fetchall()
 
-    # =========================
     # CREATE PRESENT ID SET
-    # =========================
     present_ids = set()
 
     for student in present_students:
         present_ids.add(student["student_id"])
 
-    # =========================
     # FIND ABSENT STUDENTS
-    # =========================
     absent_students = []
 
     for student in all_students:
@@ -303,24 +289,18 @@ def send_telegram_report():
         if student["student_id"] not in present_ids:
             absent_students.append(student)
 
-    # =========================
     # COUNTS
-    # =========================
     total_enrolled = len(all_students)
 
     present_count = len(present_students)
 
     absent_count = len(absent_students)
 
-    # =========================
     # FORMAT MESSAGE
-    # =========================
-    message = "📢 TODAY'S ATTENDANCE REPORT\n\n"
+    message = " TODAY'S ATTENDANCE REPORT\n\n"
 
-    # =========================
     # PRESENT LIST
-    # =========================
-    message += "✅ PRESENT STUDENTS:\n\n"
+    message += " PRESENT STUDENTS:\n\n"
 
     if present_students:
 
@@ -334,10 +314,8 @@ def send_telegram_report():
     else:
         message += "No present students\n"
 
-    # =========================
     # ABSENT LIST
-    # =========================
-    message += "\n❌ ABSENT STUDENTS:\n\n"
+    message += "\n ABSENT STUDENTS:\n\n"
 
     if absent_students:
 
@@ -351,20 +329,16 @@ def send_telegram_report():
     else:
         message += "No absent students\n"
 
-    # =========================
     # SUMMARY
-    # =========================
-    message += "\n📊 SUMMARY:\n\n"
+    message += "\n SUMMARY:\n\n"
 
-    message += f"👥 Total Enrolled: {total_enrolled}\n"
+    message += f" Total Enrolled: {total_enrolled}\n"
 
-    message += f"✅ Present: {present_count}\n"
+    message += f" Present: {present_count}\n"
 
-    message += f"❌ Absent: {absent_count}\n"
+    message += f" Absent: {absent_count}\n"
 
-    # =========================
     # SEND TELEGRAM MESSAGE
-    # =========================
     send_telegram_message(message)
 
     conn.close()

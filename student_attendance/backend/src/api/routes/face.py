@@ -22,6 +22,8 @@ from src.services.email_service import send_attendance_email
 from src.services.attendance_service import already_marked_today, mark_attendance
 from src.services.attendance_service import save_attendance
 from src.services.telegram_service import send_telegram_message
+from fastapi import Depends
+from src.utils.dependencies import get_current_user
 
 router = APIRouter()
 
@@ -29,21 +31,14 @@ router = APIRouter()
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 MODEL_PATH = os.path.join(BASE_DIR, "ml_models", "face_detection_yunet_2023mar.onnx")
 
-print("MODEL PATH:", MODEL_PATH)
-print("EXISTS:", os.path.exists(MODEL_PATH))
-
 face_service = FaceService(MODEL_PATH)
-
 
 # GLOBALS
 angle_buffer = deque(maxlen=5)
-
 required_angles = {"front", "left", "right", "up", "down"}
-
 angle_store = {}  # {student_id: set(angles)}
-angle_store_baseline = {}   #  add this
-enroll_queue = ()
-
+angle_store_baseline = {}  
+enroll_queue = {}  # {student_id: [{"angle": angle, "embedding": emb_bytes, "image": img_bytes, "data": data}, ...]}
 last_capture_time = 0
 
 def get_face_angle(landmarks, student_id):
@@ -184,13 +179,12 @@ def get_stable_angle(new_angle):
 
     return max(set(angle_buffer), key=angle_buffer.count)
 
-#  GLOBAL (top of file)
-enroll_queue = {}
-angle_store = {}
-required_angles = {"front", "left", "right", "up", "down"}
-
+# ENROLL
 @router.post("/enroll")
-def enroll(data: EnrollSchema):
+def enroll(
+    data: EnrollSchema,
+    user = Depends(get_current_user)
+   ):
     try:
         student_id = data.face_id
         full_name = f"{data.first_name} {data.last_name}"
@@ -327,16 +321,14 @@ def enroll(data: EnrollSchema):
     except Exception as e:
         print("ENROLL ERROR:", e)
         return {"status": "RED", "message": "Server error"}
-    
-    
+   
 
 class RemoveAngleSchema(BaseModel):
     student_id: str
     angle: str
-
-
+    
 @router.post("/remove-angle")
-def remove_angle(data: RemoveAngleSchema):
+def remove_angle(data: RemoveAngleSchema, user = Depends(get_current_user)):
     student_id = data.student_id
     angle = data.angle
 
@@ -356,7 +348,7 @@ def remove_angle(data: RemoveAngleSchema):
     return {"status": "REMOVED"}
 
 @router.put("/update-student")
-def update_student(data: EnrollSchema):
+def update_student(data: EnrollSchema, user = Depends(get_current_user)):
     try:
         conn = get_conn()
         cur = conn.cursor()
@@ -455,9 +447,7 @@ def recognize(data: ImageSchema, background_tasks: BackgroundTasks):
     try:
         print("\n========== RECOGNIZE ==========")
 
-        # =========================
-        # 🔹 DECODE IMAGE
-        # =========================
+        #  DECODE IMAGE
         if not data.image or len(data.image) < 100:
             return {
                 "status": "ERROR",
@@ -478,9 +468,7 @@ def recognize(data: ImageSchema, background_tasks: BackgroundTasks):
                 "faces": []
             }
 
-        # =========================
-        # 🔹 LIGHT CHECK
-        # =========================
+        #  LIGHT CHECK
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         if np.mean(gray) < 50:
@@ -490,9 +478,7 @@ def recognize(data: ImageSchema, background_tasks: BackgroundTasks):
                 "faces": []
             }
 
-        # =========================
-        # 🔹 DETECT FACE
-        # =========================
+        #  DETECT FACE
         faces = face_service.detect_faces(frame)
 
         if faces is None or len(faces) == 0:
@@ -522,9 +508,7 @@ def recognize(data: ImageSchema, background_tasks: BackgroundTasks):
                 "faces": []
             }
 
-        # =========================
-        # 🔹 EMBEDDING
-        # =========================
+        #  EMBEDDING
         h_, w_ = face_crop.shape[:2]
 
         emb = face_service.embedding_from_crop(
@@ -542,9 +526,7 @@ def recognize(data: ImageSchema, background_tasks: BackgroundTasks):
         emb = np.array(emb, dtype=np.float32)
         emb = emb / np.linalg.norm(emb)
 
-        # =========================
-        # 🔹 FETCH DB
-        # =========================
+        #  FETCH DB
         rows = fetch_all_embeddings()
 
         if not rows:
@@ -554,9 +536,7 @@ def recognize(data: ImageSchema, background_tasks: BackgroundTasks):
                 "faces": []
             }
 
-        # =========================
-        # 🔹 GROUP BY STUDENT
-        # =========================
+        #  GROUP BY STUDENT
         from collections import defaultdict
 
         grouped = defaultdict(list)
@@ -576,9 +556,7 @@ def recognize(data: ImageSchema, background_tasks: BackgroundTasks):
                 "faces": []
             }
 
-        # =========================
-        # 🔹 BEST MATCH SEARCH
-        # =========================
+        #  BEST MATCH SEARCH
         best_score = -1
         best_match = None
 
@@ -598,9 +576,7 @@ def recognize(data: ImageSchema, background_tasks: BackgroundTasks):
         print("BEST MATCH:", best_match)
         print("BEST SCORE:", best_score)
 
-        # =========================
-        # 🔹 THRESHOLD
-        # =========================
+        #  THRESHOLD
         THRESHOLD = 0.85
 
         if best_score < THRESHOLD:
@@ -611,15 +587,11 @@ def recognize(data: ImageSchema, background_tasks: BackgroundTasks):
                 "faces": []
             }
 
-        # =========================
-        # 🔹 SUCCESS
-        # =========================
+        #  SUCCESS
         student_id = best_match[0]
         student_name = best_match[1]
 
-        # =========================
-        # 🔹 GET EMAIL
-        # =========================
+        #  GET EMAIL
         conn = get_conn()
         cur = conn.cursor()
 
@@ -634,18 +606,14 @@ def recognize(data: ImageSchema, background_tasks: BackgroundTasks):
 
         conn.close()
 
-        # =========================
-        # 🔹 SAVE ATTENDANCE
-        # =========================
+        #  SAVE ATTENDANCE
         result = save_attendance(
             student_id,
             student_name,
             img_bytes
         )
 
-                # =========================
-        # 🔹 SUCCESS CASE
-        # =========================
+        #  SUCCESS CASE
         if result["success"]:
 
             # send email
@@ -655,16 +623,6 @@ def recognize(data: ImageSchema, background_tasks: BackgroundTasks):
                     student_email,
                     student_name
                 )
-
-#             # telegram message
-#             telegram_message = f"""
-# ✅ Attendance Marked
-
-# ID: {student_id}
-# Name: {student_name}
-# """
-
-#             send_telegram_message(telegram_message)
 
             return {
                 "status": "SUCCESS",
@@ -677,9 +635,7 @@ def recognize(data: ImageSchema, background_tasks: BackgroundTasks):
                 }]
             }
 
-        # =========================
-        # 🔹 ALREADY MARKED
-        # =========================
+        #  ALREADY MARKED
         else:
             return {
                 "status": "SKIPPED",

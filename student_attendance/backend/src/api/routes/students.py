@@ -1,6 +1,9 @@
 from fastapi import APIRouter
 from src.db.database import get_conn
 import base64
+from fastapi import Depends
+
+from src.utils.dependencies import get_current_user
 
 router = APIRouter()
 
@@ -50,7 +53,7 @@ def get_students():
 
 # delete student
 @router.delete("/delete-student/{student_id}")
-def delete_student(student_id: str):
+def delete_student(student_id: str, user = Depends(get_current_user)):
     try:
         conn = get_conn()
         cur = conn.cursor()

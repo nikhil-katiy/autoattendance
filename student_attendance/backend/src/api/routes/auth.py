@@ -1,104 +1,159 @@
 from fastapi import Depends, HTTPException
 from fastapi import APIRouter
 from src.db.database import get_conn
-from src.utils.jwt import create_token
+
 from fastapi import APIRouter, HTTPException
 from src.schemas.auth_schema import RegisterSchema, LoginSchema
-from src.utils.hash import hash_password, verify_password
-from src.utils.hash import verify_password
+
 from fastapi import Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
+from src.utils.auth import (
+    hash_password,
+    validate_password
+)
 
 router = APIRouter()
 
 #  REGISTER
 @router.post("/register")
-def register(user: RegisterSchema):
+def register(data: RegisterSchema):
+
+    # PASSWORD MATCH
+    if data.password != data.confirm_password:
+
+        return {
+            "status": "ERROR",
+            "message": "Passwords do not match"
+        }
+
+    # PASSWORD VALIDATION
+    error = validate_password(data.password)
+
+    if error:
+
+        return {
+            "status": "ERROR",
+            "message": error
+        }
+
     conn = get_conn()
+
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM users WHERE username=%s", (user.username,))
-    if cur.fetchone():
-        raise HTTPException(status_code=400, detail="User already registered")
-
-    #  HASH PASSWORD
-    hashed_password = hash_password(user.password)
-
+    # CHECK EMAIL
     cur.execute(
-        "INSERT INTO users (username, password) VALUES (%s, %s)",
-        (user.username, hashed_password)
+        "SELECT id FROM users WHERE email=%s",
+        (data.email,)
+    )
+
+    if cur.fetchone():
+
+        return {
+            "status": "ERROR",
+            "message": "Email already exists"
+        }
+
+    # HASH PASSWORD
+    hashed_password = hash_password(
+        data.password
+    )
+
+    # INSERT USER
+    cur.execute(
+        """
+        INSERT INTO users
+        (
+            full_name,
+            username,
+            email,
+            mobile,
+            gender,
+            role,
+            password
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s)
+        """,
+        (
+            data.full_name,
+            data.username,
+            data.email,
+            data.mobile,
+            data.gender,
+            "admin",
+            hashed_password
+        )
     )
 
     conn.commit()
+
     conn.close()
 
-    return {"message": "User Registered Successfully"}
+    return {
+        "status": "SUCCESS",
+        "message": "Registration Successful"
+    }
 
 # LOGIN
+from src.utils.auth import (
+    verify_password,
+    create_access_token
+)
+
 @router.post("/login")
-def login(user: LoginSchema):
-    conn = None
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
+def login(data: LoginSchema):
 
-        cur.execute(
-            "SELECT id, username, password FROM users WHERE username=%s",
-            (user.username,)
-        )
+    conn = get_conn()
 
-        db_user = cur.fetchone()
+    cur = conn.cursor()
 
-        if not db_user:
-            raise HTTPException(status_code=404, detail="User not registered")
+    # USERNAME OR EMAIL LOGIN
+    cur.execute(
+        """
+        SELECT *
+        FROM users
+        WHERE username=%s OR email=%s
+        """,
+        (data.username, data.username)
+    )
 
-        #  VERIFY HASH PASSWORD
-        if not verify_password(user.password, db_user[2]):
-            raise HTTPException(status_code=401, detail="Wrong password")
+    user = cur.fetchone()
 
-        #  CREATE TOKEN
-        token = create_token({
-            "user_id": db_user[0],
-            "username": db_user[1]
-        })
+    conn.close()
+
+    if not user:
 
         return {
-            "message": "Login success",
-            "token": token
+            "status": "ERROR",
+            "message": "Invalid credentials"
         }
 
-    except HTTPException:
-        raise
+    stored_password = user[7]
 
-    except Exception as e:
-        print("LOGIN ERROR:", e)
-        raise HTTPException(status_code=500, detail="Server error")
+    # VERIFY PASSWORD
+    if not verify_password(
+        data.password,
+        stored_password
+    ):
 
-    finally:
-        if conn:
-            conn.close()
-            
-            
+        return {
+            "status": "ERROR",
+            "message": "Invalid credentials"
+        }
 
-security = HTTPBearer()
+    # CREATE TOKEN
+    token = create_access_token({
 
-SECRET_KEY = "your_secret_key_123"
-ALGORITHM = "HS256"
+        "sub": user[1],
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
+        "role": user[6]
+    })
 
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    return {
 
+        "status": "SUCCESS",
+        "access_token": token,
 
-# @router.get("/Dashboard")
-# def dashboard(user=Depends(verify_token)):
-#     return {
-#         "message": "Welcome to dashboard",
-#         "user": user
-#     }
+        "token_type": "bearer",
+        "message": "Login Successful"
+    }
