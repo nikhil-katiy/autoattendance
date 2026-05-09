@@ -348,98 +348,219 @@ def remove_angle(data: RemoveAngleSchema, user = Depends(get_current_user)):
     return {"status": "REMOVED"}
 
 @router.put("/update-student")
-def update_student(data: EnrollSchema, user = Depends(get_current_user)):
+def update_student(
+    data: EnrollSchema,
+    user=Depends(get_current_user)
+):
     try:
-        conn = get_conn()
-        cur = conn.cursor()
 
-        full_name = f"{data.first_name} {data.last_name}"
+        student_id = data.face_id
 
-        #  WITHOUT IMAGE UPDATE
+        full_name = (
+            f"{data.first_name} "
+            f"{data.last_name}"
+        )
+
+        # VALIDATION
         if not data.image:
+            return {
+                "status": "RED",
+                "message": "No image"
+            }
+
+        # IMAGE DECODE
+        img_data = data.image.split(",")[1]
+
+        img_bytes = base64.b64decode(
+            img_data
+        )
+
+        np_arr = np.frombuffer(
+            img_bytes,
+            np.uint8
+        )
+
+        frame = cv2.imdecode(
+            np_arr,
+            cv2.IMREAD_COLOR
+        )
+
+        if frame is None:
+            return {
+                "status": "RED",
+                "message": "Invalid image"
+            }
+
+        # FACE DETECT
+        faces = face_service.detect_faces(
+            frame
+        )
+
+        if faces is None or len(faces) == 0:
+            return {
+                "status": "RED",
+                "message": "No face"
+            }
+
+        face = faces[0]
+
+        x, y, w, h = map(
+            int,
+            face[:4]
+        )
+
+        landmarks = np.array(
+            face[4:14]
+        ).reshape((5, 2))
+
+        current_angle = get_face_angle(
+            landmarks,
+            student_id
+        )
+
+        # INIT STORE
+        if student_id not in enroll_queue:
+            enroll_queue[student_id] = []
+
+        # DUPLICATE ANGLE
+        if current_angle in [
+            i["angle"]
+            for i in enroll_queue[student_id]
+        ]:
+
+            remaining = list(
+                required_angles - set([
+                    i["angle"]
+                    for i in enroll_queue[student_id]
+                ])
+            )
+
+            return {
+                "status": "WAIT",
+                "message":
+                    f"{current_angle} already done",
+                "next": remaining
+            }
+
+        # FACE CROP
+        face_crop = frame[
+            y:y+h,
+            x:x+w
+        ]
+
+        h, w = face_crop.shape[:2]
+
+        emb = (
+            face_service.embedding_from_crop(
+                face_crop,
+                [0, 0, w, h]
+            )
+        )
+
+        emb = np.array(
+            emb,
+            dtype=np.float32
+        )
+
+        emb = emb / np.linalg.norm(emb)
+
+        emb_bytes = emb.tobytes()
+
+        # STORE TEMP
+        enroll_queue[student_id].append({
+            "angle": current_angle,
+            "embedding": emb_bytes,
+            "image": img_bytes,
+            "data": data
+        })
+
+        # DONE
+        if len(enroll_queue[student_id]) == 5:
+
+            conn = get_conn()
+
+            cur = conn.cursor()
+
+            # DELETE OLD
             cur.execute("""
-                UPDATE embeddings
-                SET 
-                    name=%s,
-                    first_name=%s,
-                    last_name=%s,
-                    mobile=%s,
-                    email=%s,
-                    gender=%s,
-                    role=%s
+                DELETE FROM embeddings
                 WHERE student_id=%s
-            """, (
-                full_name,
-                data.first_name,
-                data.last_name,
-                data.mobile,
-                data.email,
-                data.gender,
-                data.role,
-                data.face_id
-            ))
+            """, (student_id,))
 
-        else:
-            #  WITH IMAGE UPDATE
-            img_data = data.image.split(",")[1]
-            img_bytes = base64.b64decode(img_data)
+            # INSERT NEW
+            for item in enroll_queue[
+                student_id
+            ]:
 
-            np_arr = np.frombuffer(img_bytes, np.uint8)
-            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                d = item["data"]
 
-            faces = face_service.detect_faces(frame)
+                cur.execute("""
+                    INSERT INTO embeddings
+                    (
+                        student_id,
+                        name,
+                        angle,
+                        embedding,
+                        image,
+                        first_name,
+                        last_name,
+                        mobile,
+                        email,
+                        gender,
+                        role
+                    )
+                    VALUES (
+                        %s,%s,%s,%s,%s,
+                        %s,%s,%s,%s,%s,%s
+                    )
+                """, (
+                    student_id,
+                    full_name,
+                    item["angle"],
+                    item["embedding"],
+                    item["image"],
+                    d.first_name,
+                    d.last_name,
+                    d.mobile,
+                    d.email,
+                    d.gender,
+                    d.role
+                ))
 
-            if faces is None or len(faces) == 0:
-                return {"success": False, "message": "No face"}
+            conn.commit()
 
-            f = faces[0]
-            x, y, w, h = map(int, f[:4])
-            face_crop = frame[y:y+h, x:x+w]
+            conn.close()
 
-            h, w = face_crop.shape[:2]
-            fake_box = [0, 0, w, h]
+            del enroll_queue[student_id]
 
-            emb = face_service.embedding_from_crop(face_crop, fake_box)
+            return {
+                "status": "DONE",
+                "message":
+                    "Profile Updated Successfully"
+            }
 
-            emb = np.array(emb, dtype=np.float32)
-            emb = emb / np.linalg.norm(emb)
-
-            emb_bytes = emb.tobytes()
-
-            cur.execute("""
-                UPDATE embeddings
-                SET 
-                    name=%s,
-                    first_name=%s,
-                    last_name=%s,
-                    mobile=%s,
-                    email=%s,
-                    gender=%s,
-                    role=%s,
-                    image=%s,
-                    embedding=%s
-                WHERE student_id=%s
-            """, (
-                full_name,
-                data.first_name,
-                data.last_name,
-                data.mobile,
-                data.email,
-                data.gender,
-                data.role,
-                img_bytes,
-                emb_bytes,
-                data.face_id
-            ))
-
-        conn.commit()
-        conn.close()
-
-        return {"success": True}
+        return {
+            "status": "CAPTURED",
+            "angle": current_angle,
+            "count": len(
+                enroll_queue[student_id]
+            ),
+            "remaining": list(
+                required_angles - set([
+                    i["angle"]
+                    for i in enroll_queue[student_id]
+                ])
+            )
+        }
 
     except Exception as e:
+
         print("UPDATE ERROR:", e)
-        return {"success": False}
+
+        return {
+            "status": "RED",
+            "message": "Server error"
+        }
 
 #  RECOGNIZE
 @router.post("/recognize")
