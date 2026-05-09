@@ -361,12 +361,50 @@ def update_student(
             f"{data.last_name}"
         )
 
-        # VALIDATION
+        # =========================
+        # DETAILS ONLY UPDATE
+        # =========================
         if not data.image:
+
+            conn = get_conn()
+
+            cur = conn.cursor()
+
+            cur.execute("""
+                UPDATE embeddings
+                SET
+                    name=%s,
+                    first_name=%s,
+                    last_name=%s,
+                    mobile=%s,
+                    email=%s,
+                    gender=%s,
+                    role=%s
+                WHERE student_id=%s
+            """, (
+                full_name,
+                data.first_name,
+                data.last_name,
+                data.mobile,
+                data.email,
+                data.gender,
+                data.role,
+                student_id
+            ))
+
+            conn.commit()
+
+            conn.close()
+
             return {
-                "status": "RED",
-                "message": "No image"
+                "success": True,
+                "message":
+                    "Profile Updated Successfully"
             }
+
+        # =========================
+        # IMAGE UPDATE FLOW
+        # =========================
 
         # IMAGE DECODE
         img_data = data.image.split(",")[1]
@@ -422,7 +460,7 @@ def update_student(
         if student_id not in enroll_queue:
             enroll_queue[student_id] = []
 
-        # DUPLICATE ANGLE
+        # DUPLICATE ANGLE CHECK
         if current_angle in [
             i["angle"]
             for i in enroll_queue[student_id]
@@ -457,6 +495,12 @@ def update_student(
             )
         )
 
+        if emb is None:
+            return {
+                "status": "RED",
+                "message": "Embedding failed"
+            }
+
         emb = np.array(
             emb,
             dtype=np.float32
@@ -474,20 +518,22 @@ def update_student(
             "data": data
         })
 
-        # DONE
+        # =========================
+        # SAVE AFTER 5 IMAGES
+        # =========================
         if len(enroll_queue[student_id]) == 5:
 
             conn = get_conn()
 
             cur = conn.cursor()
 
-            # DELETE OLD
+            # DELETE OLD DATA
             cur.execute("""
                 DELETE FROM embeddings
                 WHERE student_id=%s
             """, (student_id,))
 
-            # INSERT NEW
+            # INSERT NEW DATA
             for item in enroll_queue[
                 student_id
             ]:
@@ -531,6 +577,7 @@ def update_student(
 
             conn.close()
 
+            # CLEAR QUEUE
             del enroll_queue[student_id]
 
             return {
@@ -539,6 +586,9 @@ def update_student(
                     "Profile Updated Successfully"
             }
 
+        # =========================
+        # CAPTURE RESPONSE
+        # =========================
         return {
             "status": "CAPTURED",
             "angle": current_angle,
